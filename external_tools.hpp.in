@@ -1,0 +1,12 @@
+#pragma once
+
+// Von CMake generiert (siehe CMakeLists.txt) — Pfade zu den per ExternalProject
+// gebauten Binaries aus https://github.com/ccodel/dsr-trim.
+inline constexpr const char* DSR_TRIM_PATH  = "@DSR_TRIM_BINARY@";
+inline constexpr const char* LSR_CHECK_PATH = "@LSR_CHECK_BINARY@";
+
+// Pfade zu den per ExternalProject gebauten Binaries aus
+// https://github.com/rubenGoetz/PalRUP-Check.
+inline constexpr const char* PALRUP_LOCAL_CHECK_PATH  = "@PALRUP_LOCAL_CHECK_BINARY@";
+inline constexpr const char* PALRUP_REDISTRIBUTE_PATH = "@PALRUP_REDISTRIBUTE_BINARY@";
+inline constexpr const char* PALRUP_CONFIRM_PATH      = "@PALRUP_CONFIRM_BINARY@";

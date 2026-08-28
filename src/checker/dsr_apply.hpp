@@ -2,27 +2,22 @@
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../cnf.hpp"
 #include "parse_util.hpp"
 
-
-inline bool apply_lsr_proof(Cnf& cnf, const std::string& lsr_path) {
-    FILE* f = fopen(lsr_path.c_str(), "r");
+inline bool apply_dsr_proof(Cnf& cnf, const std::string& dsr_path) {
+    FILE* f = fopen(dsr_path.c_str(), "r");
     if (!f) return false;
 
-    int id;
-    while (read_int(f, id)) {
-        if (peek_after_whitespace(f) == 'd') {
-            fgetc(f);  // consume the 'd'
-            int del_id;
-            while (read_int(f, del_id) && del_id != 0)
-                cnf.remove_clause(del_id);
-            continue;
-        }
+    int next_id = cnf.next_free_id();
+    int c;
+    while ((c = peek_after_whitespace(f)) != EOF) {
+        bool is_deletion = (c == 'd');
+        if (is_deletion) fgetc(f);  // consume the 'd'
 
-        
         std::vector<int> clause;
         int pivot = 0;
         bool have_pivot = false;
@@ -32,7 +27,7 @@ inline bool apply_lsr_proof(Cnf& cnf, const std::string& lsr_path) {
                 pivot = lit;
                 have_pivot = true;
                 clause.push_back(lit);
-            } else if (lit == pivot) {
+            } else if (!is_deletion && lit == pivot) {
                 while (read_int(f, lit) && lit != 0) {}  // skip the witness
                 break;
             } else {
@@ -40,10 +35,10 @@ inline bool apply_lsr_proof(Cnf& cnf, const std::string& lsr_path) {
             }
         }
 
-        int hint;
-        while (read_int(f, hint) && hint != 0) {}  // skip the hints
-
-        cnf.add_clause(id, std::move(clause));
+        if (is_deletion)
+            cnf.remove_clause_by_literals(std::move(clause));
+        else
+            cnf.add_clause(next_id++, std::move(clause));
     }
 
     fclose(f);

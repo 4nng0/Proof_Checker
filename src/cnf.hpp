@@ -1,16 +1,19 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-// Bringt eine Klausel in kanonische Form: Literale nach Variable sortiert,
-// doppelte Literale entfernt. Gibt true zurück, wenn die Klausel dadurch als
-// tautologisch erkannt wird (x und -x beide enthalten) -- eine tautologische
-// Klausel ist immer erfüllt und wird beim Vergleich ignoriert.
+// Brings a clause into canonical form: literals sorted by variable, duplicate
+// literals removed. Returns true if the clause is thereby recognised as
+// tautological (containing both x and -x) -- a tautological clause is always
+// satisfied and is ignored when comparing.
 inline bool canonicalize_clause(std::vector<int>& clause) {
     std::sort(clause.begin(), clause.end(), [](int a, int b) {
         int va = std::abs(a), vb = std::abs(b);
@@ -23,12 +26,10 @@ inline bool canonicalize_clause(std::vector<int>& clause) {
     return false;
 }
 
-// Repräsentiert eine CNF-Formel als ID-indiziertes Klausel-Array (1-indiziert,
-// wie in LRAT/LSR-Beweisen). Gelöschte Klauseln werden als std::nullopt
-// gehalten statt entfernt, damit IDs stabile Indizes bleiben.
+
 class Cnf {
 public:
-    // Lädt eine DIMACS-CNF-Datei; Klauseln bekommen IDs 1..n in Dateireihenfolge.
+    // Loads a DIMACS CNF file; clauses get IDs 1..n in file order.
     bool load(const std::string& path) {
         FILE* f = fopen(path.c_str(), "r");
         if (!f) return false;
@@ -106,16 +107,47 @@ public:
             clauses_[id - 1] = std::nullopt;
     }
 
-    // Lädt die Ziel-CNF unter `path` unabhängig und vergleicht sie mit *this,
-    // bis auf Klausel-/Literal-Reihenfolge, doppelte Literale/Klauseln und Tautologien 
-    //keiner dieser Unterschiede ändert die erfüllenden Belegungen der Formel.
-    bool check_equal_with_goal_path(const std::string& path) const {
-        Cnf goal;
-        if (!goal.load(path)) return false;
-        return canonical_clause_set() == goal.canonical_clause_set();
+    void remove_clause_by_literals(std::vector<int> lits) {
+        if (canonicalize_clause(lits)) return;
+
+        build_content_index();
+        auto range = content_index_.equal_range(clause_hash(lits));
+        for (auto it = range.first; it != range.second; ++it) {
+            auto& slot = clauses_[it->second - 1];
+            if (slot && *slot == lits) {
+                slot = std::nullopt;
+                content_index_.erase(it);
+                return;
+            }
+        }
     }
 
-    // true, sobald irgendwann eine leere Klausel hinzugefügt wurde 
+
+    int next_free_id() const { return (int)clauses_.size() + 1; }
+
+
+    bool check_goal_is_subset(const std::string& path) const {
+        Cnf goal;
+        if (!goal.load(path)) return false;
+        auto own = canonical_clause_set();
+        auto goal_clauses = goal.canonical_clause_set();
+
+        std::vector<std::vector<int>> missing;
+        std::set_difference(goal_clauses.begin(), goal_clauses.end(),
+                             own.begin(), own.end(), std::back_inserter(missing));
+
+        for (const auto& clause : missing) {
+            std::fprintf(stderr, "clause (");
+            for (size_t i = 0; i < clause.size(); i++)
+                std::fprintf(stderr, "%s%d", i ? " " : "", clause[i]);
+            std::fprintf(stderr, ") occurs only in the second CNF (%s), not in the first\n",
+                         path.c_str());
+        }
+
+        return missing.empty();
+    }
+
+    // true as soon as an empty clause has been added at some point
     bool has_empty_clause() const { return derived_empty_clause_; }
 
     int declared_num_vars() const { return declared_num_vars_; }
@@ -124,12 +156,36 @@ public:
 private:
     void set_clause(int id, std::vector<int> clause) {
         if (clause.empty()) derived_empty_clause_ = true;
+        
+        canonicalize_clause(clause);
         if (id > (int)clauses_.size()) {
             if (id > (int)clauses_.capacity())
                 clauses_.reserve(std::max<size_t>(id, clauses_.capacity() * 2));
             clauses_.resize(id);
         }
         clauses_[id - 1] = std::move(clause);
+        if (content_index_built_)
+            content_index_.emplace(clause_hash(*clauses_[id - 1]), id);
+    }
+
+    static size_t clause_hash(const std::vector<int>& clause) {
+        size_t h = 1469598103934665603ull;
+        for (int lit : clause) {
+            h ^= (size_t)(unsigned)lit;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+
+    // The index costs memory proportional to the formula size and is only needed
+    // by the DSR path -- so build it only on the first content-based deletion.
+    // The LRAT/LSR path deletes by ID and pays nothing for it.
+    void build_content_index() {
+        if (content_index_built_) return;
+        content_index_built_ = true;
+        content_index_.reserve(clauses_.size());
+        for (size_t i = 0; i < clauses_.size(); i++)
+            if (clauses_[i]) content_index_.emplace(clause_hash(*clauses_[i]), (int)(i + 1));
     }
 
     std::vector<std::vector<int>> canonical_clause_set() const {
@@ -147,6 +203,10 @@ private:
     }
 
     std::vector<std::optional<std::vector<int>>> clauses_;
+    // Hash of the canonical clause -> ID. Clauses occurring more than once are
+    // stored as several entries, so a deletion hits exactly one occurrence.
+    std::unordered_multimap<size_t, int> content_index_;
+    bool content_index_built_ = false;
     bool derived_empty_clause_ = false;
     int declared_num_vars_ = 0;
     int declared_num_clauses_ = 0;

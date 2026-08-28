@@ -1,5 +1,7 @@
+#include <chrono>
 #include <iostream>
 #include <filesystem>
+#include <iomanip>
 #include <memory>
 #include <vector>
 #include <map>
@@ -47,13 +49,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Dateien aufteilen: 's'-Dateien (step) und 'p'-Dateien (post)
+    // Split the files: 's' files (step) and 'p' files (post)
     std::map<int, fs::path> stepMap;
     std::map<int, fs::path> postMap;
 
     for (const auto& entry : fs::directory_iterator(proofDir)) {
-        // Kein is_regular_file()-Filter: ein Beweis kann auch ein Verzeichnis
-        // sein (z.B. step2.palrup/ mit mehreren Dateien drin).
         const fs::path& p = entry.path();
         std::string stem = p.stem().string();
         if (stem.empty()) continue;
@@ -78,7 +78,7 @@ int main(int argc, char* argv[]) {
 
     int total = (int)stepMap.size();
 
-    // post muss genau 1 kleiner sein als step (kein post nach letztem Schritt)
+    // post count must be exactly 1 less than step count (no post after the last step)
     if ((int)postMap.size() != total - 1) {
         std::cerr << "Error: expected " << total - 1 << " post files, found "
                   << postMap.size() << "\n";
@@ -89,10 +89,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Proof dir: " << fs::absolute(proofDir) << "\n";
     std::cout << "Steps:     " << total << "\n\n";
 
-    // Alle Checker erstellen. Jeder ist komplett unabhängig: er lädt seine
-    // eigene Eingabe-CNF, wendet seinen eigenen Beweis an, und vergleicht das
-    // Ergebnis entweder mit der nächsten post<N>.cnf (per set_goal_cnf, für
-    // START/MIDDLE) oder zeigt selbst UNSAT (END/ONLY, kein Ziel gesetzt).
     std::vector<std::unique_ptr<CheckerInterface>> checkers;
 
     if (total == 1) {
@@ -109,28 +105,42 @@ int main(int argc, char* argv[]) {
 
     for (auto& c : checkers) c->start();
 
-    // Meldet jeden Schritt (Datei + OK/FAILED), sobald er fertig ist, und
-    // bricht beim ersten Fehler sofort ab.
-    std::vector<bool> reported(checkers.size(), false);
     bool any_pending = true;
     while (any_pending) {
         any_pending = false;
-        for (size_t i = 0; i < checkers.size(); i++) {
-            if (reported[i]) continue;
-            if (!checkers[i]->is_done()) {
-                any_pending = true;
-                continue;
-            }
-            reported[i] = true;
-            bool ok = checkers[i]->succeeded();
-            std::cout << "Step " << i + 1 << " (" << stepMap[(int)i + 1].filename().string() << "): "
-                      << (ok ? "OK" : "FAILED") << "\n";
-            if (!ok) {
-                std::cerr << "\nError: proof verification failed\n";
-                return 1;
-            }
-        }
-        if (any_pending) std::this_thread::yield();
+        for (auto& c : checkers) if (!c->is_done()) { any_pending = true; break; }
+        if (any_pending) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    std::cout << "\n"
+              << std::left << std::setw(6) << "Step"
+              << std::setw(20) << "File"
+              << std::setw(8) << "Result"
+              << std::setw(10) << "Checker"
+              << std::setw(10) << "CnfMatch"
+              << std::right << std::setw(12) << "Wall(s)"
+              << std::setw(12) << "CPU(s)" << "\n";
+
+    bool all_ok = true;
+    for (size_t i = 0; i < checkers.size(); i++) {
+        bool ok = checkers[i]->succeeded();
+        all_ok = all_ok && ok;
+        std::string cnf_match_str = checkers[i]->has_cnf_match()
+            ? (checkers[i]->cnf_match_ok() ? "OK" : "FAILED")
+            : "n/a";
+        std::cout << std::left << std::setw(6) << (i + 1)
+                  << std::setw(20) << stepMap[(int)i + 1].filename().string()
+                  << std::setw(8) << (ok ? "OK" : "FAILED")
+                  << std::setw(10) << (checkers[i]->checker_ok() ? "OK" : "FAILED")
+                  << std::setw(10) << cnf_match_str
+                  << std::right << std::fixed << std::setprecision(3)
+                  << std::setw(12) << checkers[i]->wall_seconds()
+                  << std::setw(12) << checkers[i]->cpu_seconds() << "\n";
+    }
+
+    if (!all_ok) {
+        std::cerr << "\nError: proof verification failed\n";
+        return 1;
     }
 
     std::cout << "\nAll steps verified.\n";

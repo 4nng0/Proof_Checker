@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -11,8 +14,6 @@
 #include <unistd.h>
 #include <vector>
 #include "../checker_interface.hpp"
-#include "../cnf.hpp"
-#include "lsr_apply.hpp"
 #include "../subprocess.hpp"
 #include "external_tools.hpp"
 
@@ -25,6 +26,8 @@ class PalRupChecker : public CheckerInterface {
 
     std::atomic<bool> _done{false};
     std::atomic<bool> _succeeded{false};
+    std::atomic<double> _cpu_seconds{0.0};
+    std::atomic<double> _wall_seconds{0.0};
     std::thread _thread;
 
     bool expects_goal() const {
@@ -60,7 +63,7 @@ class PalRupChecker : public CheckerInterface {
         }
         if (!palrup_path || pal_ids.empty()) return std::nullopt;
 
-        // pal-ids müssen lückenlos 0..n-1 sein, damit num-solvers eindeutig ist.
+        // pal-ids must run contiguously 0..n-1 so that num-solvers is unambiguous.
         std::sort(pal_ids.begin(), pal_ids.end());
         for (size_t i = 0; i < pal_ids.size(); i++)
             if (pal_ids[i] != i) return std::nullopt;
@@ -68,24 +71,30 @@ class PalRupChecker : public CheckerInterface {
         return std::make_pair(*palrup_path, (unsigned)pal_ids.size());
     }
 
-    // Startet alle Kommandos einer Stufe parallel und wartet, bis jedes
-    // fertig ist -- true nur, wenn ausnahmslos jedes mit Exit-Code 0 endete.
-    static bool run_stage(const std::vector<std::vector<std::string>>& commands) {
+    // Starts all commands of a stage in parallel and waits until each one has
+    // finished -- true only if every single one exited with code 0.
+    // cpu_accum gets the summed CPU time of all commands of this stage added
+    // to it (not assigned), since several stages are called one after another.
+    static bool run_stage(const std::vector<std::vector<std::string>>& commands, double& cpu_accum) {
         std::vector<pid_t> pids;
         pids.reserve(commands.size());
         for (const auto& cmd : commands)
             pids.push_back(spawn_process(cmd));
 
         bool ok = true;
-        for (pid_t pid : pids)
-            ok = (pid >= 0 && wait_for_process(pid)) && ok;
+        for (pid_t pid : pids) {
+            double cpu = 0.0;
+            bool this_ok = (pid >= 0 && wait_for_process(pid, cpu));
+            cpu_accum += cpu;
+            ok = this_ok && ok;
+        }
         return ok;
     }
 
     bool check_stages(const fs::path& palrup_path, const fs::path& working_dir,
-                       unsigned num_solvers, unsigned root_ceil, unsigned comm_size) const {
-        // Stufe 1: 
-        
+                       unsigned num_solvers, unsigned root_ceil, unsigned comm_size, double& cpu_accum) const {
+        // Stage 1:
+
         std::vector<std::vector<std::string>> local_check_cmds;
         for (unsigned i = 0; i < num_solvers; i++)
             local_check_cmds.push_back({PALRUP_LOCAL_CHECK_PATH,
@@ -94,18 +103,18 @@ class PalRupChecker : public CheckerInterface {
                 "-working-path=" + working_dir.string(),
                 "-num-solvers=" + std::to_string(num_solvers),
                 "-pal-id=" + std::to_string(i)});
-        if (!run_stage(local_check_cmds)) return false;
+        if (!run_stage(local_check_cmds, cpu_accum)) return false;
 
-        // Stufe 2: 
+        // Stage 2:
         std::vector<std::vector<std::string>> redistribute_cmds;
         for (unsigned i = 0; i < comm_size; i++)
             redistribute_cmds.push_back({PALRUP_REDISTRIBUTE_PATH,
                 "-working-path=" + working_dir.string(),
                 "-num-solvers=" + std::to_string(num_solvers),
                 "-pal-id=" + std::to_string(i)});
-        if (!run_stage(redistribute_cmds)) return false;
+        if (!run_stage(redistribute_cmds, cpu_accum)) return false;
 
-        // Stufe 3: 
+        // Stage 3:
         std::vector<std::vector<std::string>> confirm_cmds;
         for (unsigned i = 0; i < num_solvers; i++)
             confirm_cmds.push_back({PALRUP_CONFIRM_PATH,
@@ -113,7 +122,7 @@ class PalRupChecker : public CheckerInterface {
                 "-working-path=" + working_dir.string(),
                 "-num-solvers=" + std::to_string(num_solvers),
                 "-pal-id=" + std::to_string(i)});
-        if (!run_stage(confirm_cmds)) return false;
+        if (!run_stage(confirm_cmds, cpu_accum)) return false;
 
         std::error_code ec;
         if (!fs::is_directory(working_dir / ".unsat_found", ec)) return false;
@@ -128,7 +137,7 @@ class PalRupChecker : public CheckerInterface {
         return check_ok_count == num_solvers;
     }
 
-    bool run_check() const {
+    bool run_check(double& cpu_accum) const {
         auto located = locate_fragments(_proof_file);
         if (!located) return false;
         const fs::path& palrup_path = located->first;
@@ -143,14 +152,14 @@ class PalRupChecker : public CheckerInterface {
 
         std::error_code ec;
         fs::remove_all(working_dir, ec);
-        
+
         for (unsigned i = 0; i < comm_size; i++)
             fs::create_directories(working_dir / std::to_string(i / root_ceil) / std::to_string(i), ec);
 
-        bool ok = check_stages(palrup_path, working_dir, num_solvers, root_ceil, comm_size);
+        bool ok = check_stages(palrup_path, working_dir, num_solvers, root_ceil, comm_size, cpu_accum);
 
         fs::remove_all(working_dir, ec);
-        
+
         for (unsigned i = 0; i < num_solvers; i++) {
             fs::path fragment = palrup_path / std::to_string(i / root_ceil) / std::to_string(i) / "out.palrup";
             fs::remove(fragment.string() + ".hash", ec);
@@ -166,12 +175,25 @@ public:
         }
 
     void set_goal_cnf(const std::string& path) override {
-        assert(false && "set_goal_cnf ist nur für START/MIDDLE vorgesehen, PALRUP ist immer END/ONLY");
+        assert(false && "set_goal_cnf is only intended for START/MIDDLE, PALRUP is always END/ONLY");
     }
 
     void start() override {
         _thread = std::thread([this]() {
-            bool ok = run_check();
+            auto wall_t0 = std::chrono::steady_clock::now();
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t0);
+
+            double child_cpu = 0.0;
+            bool ok = run_check(child_cpu);
+            if (!ok)
+                std::fprintf(stderr, "PALRUP check failed for %s\n", _proof_file.c_str());
+
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t1);
+            double thread_cpu = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+            _cpu_seconds.store(thread_cpu + child_cpu);
+            _wall_seconds.store(std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_t0).count());
+
             _succeeded.store(ok);
             _done.store(true);
         });
@@ -180,4 +202,12 @@ public:
 
     bool is_done() const override { return _done.load(); }
     bool succeeded() const override { return _succeeded.load(); }
+    // PALRUP checks legitimacy and the UNSAT result in a single distributed
+    // run (see check_stages) -- unlike LRAT/SR, this cannot be split
+    // into "Checker" and "CNF match".
+    bool checker_ok() const override { return _succeeded.load(); }
+    bool cnf_match_ok() const override { return _succeeded.load(); }
+    bool has_cnf_match() const override { return false; }
+    double cpu_seconds() const override { return _cpu_seconds.load(); }
+    double wall_seconds() const override { return _wall_seconds.load(); }
 };
